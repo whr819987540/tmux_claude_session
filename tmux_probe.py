@@ -13,6 +13,7 @@
   tmux_probe.py --json       JSON 输出
 """
 import argparse
+import datetime
 import glob
 import json
 import os
@@ -154,10 +155,46 @@ def find_transcript(sid, cwd):
     return hits[0] if hits else None
 
 
+def message_time(line):
+    """若该行是 user/assistant 消息则返回其时间戳（epoch 秒），否则返回 None。"""
+    try:
+        d = json.loads(line)
+    except ValueError:
+        return None
+    if not isinstance(d, dict) or d.get("type") not in ("user", "assistant") or d.get("isMeta"):
+        return None
+    try:
+        # Python < 3.11 的 fromisoformat 不认识末尾的 Z
+        return datetime.datetime.fromisoformat(d["timestamp"].replace("Z", "+00:00")).timestamp()
+    except (KeyError, AttributeError, ValueError):
+        return None
+
+
+def last_message_time(path, chunk=1 << 16):
+    """从 transcript 末尾向前查找最后一条消息的时间。
+
+    文件 mtime 不可靠：mode、ai-title 等元数据记录也会追加写入。
+    """
+    with open(path, "rb") as f:
+        pos = f.seek(0, os.SEEK_END)
+        head = b""
+        while pos > 0:
+            step = min(chunk, pos)
+            pos -= step
+            f.seek(pos)
+            lines = (f.read(step) + head).split(b"\n")
+            head = lines.pop(0)  # 可能是被块边界截断的行，并入下一块
+            for line in reversed(lines):
+                ts = message_time(line)
+                if ts is not None:
+                    return ts
+        return message_time(head)
+
+
 def describe_claude(proc, pid_files):
     info = {"pid": proc["pid"], "argv": proc["argv"], "session_id": None, "source": None,
             "status": None, "name": None, "kind": None, "cwd": None, "version": None,
-            "transcript": None, "transcript_mtime": None}
+            "transcript": None, "last_message_time": None}
     data = pid_files.get(proc["pid"])
     # procStart 与 /proc 中的启动时间不一致说明 pid 已被复用，该文件已过期
     if data and str(data.get("procStart", proc["starttime"])) == proc["starttime"]:
@@ -176,7 +213,10 @@ def describe_claude(proc, pid_files):
         path = find_transcript(info["session_id"], info["cwd"])
         if path:
             info["transcript"] = path
-            info["transcript_mtime"] = os.path.getmtime(path)
+            try:
+                info["last_message_time"] = last_message_time(path)
+            except OSError:
+                pass
     return info
 
 
@@ -260,7 +300,7 @@ def print_table(windows):
             ("窗口名", width("窗口名", [w["window_name"] for w in windows], 16)),
             ("窗格", width("窗格", [pane_label(p) for p in panes], 10)),
             ("工作目录", width("工作目录", [short_path(p["cwd"]) for p in panes], 40)),
-            ("Claude 会话 ID", 37), ("状态", 6), ("最近写入", 8)]
+            ("Claude 会话 ID", 37), ("状态", 6), ("最后消息", 8)]
 
     def emit(cells, tail):
         print("  ".join(fit(c, w) for c, (_, w) in zip(cells, cols)) + "  " + fit(tail, 40).rstrip())
@@ -287,7 +327,7 @@ def print_table(windows):
                 name = c["name"] or ("(" + " ".join(["claude"] + c["argv"][1:]) + ")")
                 if c["cwd"] and c["cwd"] != p["cwd"]:
                     name += f"  [claude cwd: {short_path(c['cwd'])}]"
-                emit(win_cells + pane_cells + [sid, c["status"] or "-", ago(c["transcript_mtime"])], name)
+                emit(win_cells + pane_cells + [sid, c["status"] or "-", ago(c["last_message_time"])], name)
                 win_cells, pane_cells = ["", ""], ["", ""]
 
     n_claude = sum(len(p["claude"]) for p in panes)
